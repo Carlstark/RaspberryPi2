@@ -1,0 +1,35 @@
+NAME=rtl8723b_mp_chip_bt40_fw_asic_rom_patch_linux_usb
+
+===============================================================================
+         RTL8723B Linux USB Bluetooth Patch Code Released Note
+===============================================================================
+   Build Time   : 2014/09/29  AM 20:42:34
+   Output File  : NAME_0x1E3E_73F8_140929_2042_new.bin
+   File Version : 0x1E3E_73F8
+===============================================================================
+* Source File 1 : rtl8723b_mp_bt40_fw_asic_rom_patch.bin
+* ECO Version : mp a-cut
+* HCI Sub-Version : 0x1E3D
+* LMP Sub-Version : 0x83B8
+* SVN Version : 11936
+* BTCOEX Version : 20140110-4940
+* Offset : 0x00000030 / Size : 22548 bytes
+* Updated Note :
+
+
+
+
+
+* Source File 2 : rtl8723b_mp_bcut_bt40_fw_asic_rom_patch.bin
+* ECO Version : mp b-cut
+* HCI Sub-Version : 0x0E3E
+* LMP Sub-Version : 0x73F8
+* SVN Version : 13430
+* BTCOEX Version : 20140708-5240
+* Offset : 0x000058C0 / Size : 24256 bytes
+* Updated Note :
+
+
+
+
+
