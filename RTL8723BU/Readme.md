@@ -4,7 +4,7 @@
 * [Kernel] linux-3.18.14
 
 #### Build Source
-* `./build all <kernelPath>`
+* `./build.sh all <kernelPath>`
 
 Target images are created under directory `install`.
 
