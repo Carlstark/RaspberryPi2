@@ -1,6 +1,7 @@
 /*
  *
- *  Realtek Bluetooth USB driver
+ *  RTL8723BU Bluetooth USB driver
+ *
  *
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -19,225 +20,404 @@
  *
  */
 
-#include <linux/kernel.h>
+#define RTL8723BU_SUPPORT
+
 #include <linux/module.h>
-#include <linux/init.h>
-#include <linux/slab.h>
-#include <linux/types.h>
-#include <linux/sched.h>
-#include <linux/errno.h>
-#include <linux/skbuff.h>
 #include <linux/usb.h>
-#include <linux/dcache.h>
-#include <asm/unaligned.h>
+#include <linux/firmware.h>
 
-/*******************************/
-#include "rtk_btusb.h"
+#include <net/bluetooth/bluetooth.h>
+#include <net/bluetooth/hci_core.h>
 
-#if 1
-#define RTKBT_DBG(fmt, arg...) printk(KERN_INFO "rtk_btusb: " fmt "\n" , ## arg)
+#define VERSION "0.6"
+
+#ifdef RTL8723BU_SUPPORT
+# include <linux/version.h>
+# include <linux/suspend.h>
+# include <asm/unaligned.h>		/* get_unaligned_le16 */
+
+/*
+ * when os suspend, module is still powered,usb is not powered,
+ * this may set to 1 ,and must comply with special patch code
+ */
+# define CONFIG_RESET_RESUME		0
+
+/*
+ * CONFIG_BLUEDROID	 0: bluez; 1: bluedroid
+ */
+#define CONFIG_BLUEDROID        0
+
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 33)
+# define HDEV_BUS		hdev->bus
+# define USB_RPM			1
 #else
-#define RTKBT_DBG(fmt, arg...)
+# define HDEV_BUS		hdev->type
+# define USB_RPM			0
 #endif
 
-#if 1
-#define RTKBT_ERR(fmt, arg...) printk(KERN_ERR "rtk_btusb: " fmt "\n" , ## arg)
-#else
-#define RTKBT_ERR(fmt, arg...)
-#endif
+#define BTUSB_RPM		0*USB_RPM 	//	1 SS enable; 0 SS disable
 
-#ifndef STREAM_REASSEMBLY
-# define STREAM_REASSEMBLY 0
-#endif
+# define URB_CANCELING_DELAY_MS  10
+#define PRINT_CMD_EVENT			0
+#define PRINT_ACL_DATA			0
 
+#define HCI_CMD_READ_BD_ADDR 0x1009
+#define HCI_VENDOR_CHANGE_BDRATE 0xfc17
+#define HCI_VENDOR_READ_RTK_ROM_VERISION 0xfc6d
+#define HCI_VENDOR_READ_LMP_VERISION 0x1001
 
-#if CONFIG_BLUEDROID //for 4.2
-#define DEVICE_NAME "rtk_btusb"
-static dev_t first; // Global variable for the first device number
-static struct cdev c_dev; // Global variable for the character device structure
-static struct class *cl; // Global variable for the device class
+#define ROM_LMP_8723a               0x1200
+#define ROM_LMP_8723b               0x8723
+#define ROM_LMP_8821a               0X8821
+#define ROM_LMP_8761a               0X8761
 
-/* HCI device list */
-static DEFINE_RWLOCK(hci_dev_list_lock);
-struct hci_dev *Ghdev = NULL;
+#define BTUSB_NEXT_RX_URB_SUBMITTING		5
 
-static struct file_operations btfcd_file_ops_g =
+//signature: Realtech
+const uint8_t  RTK_EPATCH_SIGNATURE[8]={0x52,0x65,0x61,0x6C,0x74,0x65,0x63,
+0x68};
+//Extension Section IGNATURE:0x77FD0451
+const uint8_t Extension_Section_SIGNATURE[4]={0x51,0x04,0xFD,0x77};
+uint16_t project_id[]=
 {
-    open    : btfcd_open,
-    release : btfcd_close,
-    read    : btfcd_read,
-    write   : btfcd_write,
-    poll    : btfcd_poll
+	ROM_LMP_8723a,
+	ROM_LMP_8723b,
+	ROM_LMP_8821a,
+	ROM_LMP_8761a
 };
-#endif
-/*******************************/
+struct rtk_eversion_evt {
+	uint8_t status;
+	uint8_t version;
+}__attribute__ ((packed));
 
-#define VERSION "2.13"
+struct rtk_epatch_entry{
+	uint16_t chipID;
+	uint16_t patch_length;
+	uint32_t start_offset;
+} __attribute__ ((packed));
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 7, 1)
-static bool reset = 0;
-#endif
+struct rtk_epatch{
+    	uint8_t signature[8];
+	uint32_t fw_version;
+	uint16_t number_of_total_patch;
+	struct rtk_epatch_entry entry[0];
+} __attribute__ ((packed));
+
+struct rtk_extension_entry{
+	uint8_t opcode;
+	uint8_t length;
+	uint8_t *data;
+} __attribute__ ((packed));
+
+/* 
+ * internal functions
+ */
+static int patch_add(struct usb_interface* intf);
+static void patch_remove(struct usb_interface* intf);
+static int download_patch(struct usb_interface* intf);
+static int set_btoff(struct usb_interface* intf);
+static void print_event(struct sk_buff *skb);
+static void print_command(struct sk_buff *skb);
+static void print_acl (struct sk_buff *skb,int dataOut);
+
+static bool isRTL8723bu = false;
+
+#endif	/* RTL8723BU_SUPPORT */
+
+static bool disable_scofix;
+static bool force_scofix;
+
+static bool reset = 1;
 
 static struct usb_driver btusb_driver;
-static struct usb_device_id btusb_table[] = {
-	{ .match_flags = USB_DEVICE_ID_MATCH_VENDOR |
-					 USB_DEVICE_ID_MATCH_INT_INFO,
-	  .idVendor = 0x0bda,
-	  .bInterfaceClass = 0xe0,
-	  .bInterfaceSubClass = 0x01,
-	  .bInterfaceProtocol = 0x01 },
 
-	{ .match_flags = USB_DEVICE_ID_MATCH_VENDOR |
-					 USB_DEVICE_ID_MATCH_INT_INFO,
-	  .idVendor = 0x13d3,
-	  .bInterfaceClass = 0xe0,
-	  .bInterfaceSubClass = 0x01,
-	  .bInterfaceProtocol = 0x01 },
-	  
-	{ }
+#define BTUSB_IGNORE		0x01
+#define BTUSB_DIGIANSWER	0x02
+#define BTUSB_CSR		0x04
+#define BTUSB_SNIFFER		0x08
+#define BTUSB_BCM92035		0x10
+#define BTUSB_BROKEN_ISOC	0x20
+#define BTUSB_WRONG_SCO_MTU	0x40
+#define BTUSB_ATH3012		0x80
+#define BTUSB_INTEL		0x100
+#define BTUSB_INTEL_BOOT	0x200
+#define BTUSB_BCM_PATCHRAM	0x400
+#define BTUSB_MARVELL		0x800
+#define BTUSB_REALTEK		0x1000
+
+static const struct usb_device_id btusb_table[] = {
+	/* Realtek  */
+	{ USB_VENDOR_AND_INTERFACE_INFO(0x0bda, 0xe0, 0x01, 0x01) },
+	{ USB_VENDOR_AND_INTERFACE_INFO(0x13d3, 0xe0, 0x01, 0x01) },
+
+	{ }	/* Terminating entry */
 };
 
-#if LINUX_VERSION_CODE > KERNEL_VERSION(3, 18, 0)
+MODULE_DEVICE_TABLE(usb, btusb_table);
+
+static const struct usb_device_id blacklist_table[] = {
+	{ USB_DEVICE(0x0bda, 0xb720), .driver_info = BTUSB_REALTEK },
+	{ }	/* Terminating entry */
+};
+
+#define BTUSB_MAX_ISOC_FRAMES	10
+
+#define BTUSB_INTR_RUNNING	0
+#define BTUSB_BULK_RUNNING	1
+#define BTUSB_ISOC_RUNNING	2
+#define BTUSB_SUSPENDING	3
+#define BTUSB_DID_ISO_RESUME	4
+
+struct btusb_data {
+	struct hci_dev       *hdev;
+	struct usb_device    *udev;
+	struct usb_interface *intf;
+	struct usb_interface *isoc;
+
+	unsigned long flags;
+
+	struct work_struct work;
+	struct work_struct waker;
+
+	struct usb_anchor deferred;
+	struct usb_anchor tx_anchor;
+	int tx_in_flight;
+	spinlock_t txlock;
+
+	struct usb_anchor intr_anchor;
+	struct usb_anchor bulk_anchor;
+	struct usb_anchor isoc_anchor;
+	spinlock_t rxlock;
+
+	struct sk_buff *evt_skb;
+	struct sk_buff *acl_skb;
+	struct sk_buff *sco_skb;
+
+	struct usb_endpoint_descriptor *intr_ep;
+	struct usb_endpoint_descriptor *bulk_tx_ep;
+	struct usb_endpoint_descriptor *bulk_rx_ep;
+	struct usb_endpoint_descriptor *isoc_tx_ep;
+	struct usb_endpoint_descriptor *isoc_rx_ep;
+
+	__u8 cmdreq_type;
+
+	unsigned int sco_num;
+	int isoc_altsetting;
+	int suspend_count;
+};
+
 static inline void btusb_free_frags(struct btusb_data *data)
 {
-    unsigned long flags;
+	unsigned long flags;
 
-    spin_lock_irqsave(&data->rxlock, flags);
+	spin_lock_irqsave(&data->rxlock, flags);
 
-    kfree_skb(data->evt_skb);
-    data->evt_skb = NULL;
+	kfree_skb(data->evt_skb);
+	data->evt_skb = NULL;
 
-    kfree_skb(data->acl_skb);
-    data->acl_skb = NULL;
+	kfree_skb(data->acl_skb);
+	data->acl_skb = NULL;
 
-    kfree_skb(data->sco_skb);
-    data->sco_skb = NULL;
+	kfree_skb(data->sco_skb);
+	data->sco_skb = NULL;
 
-    spin_unlock_irqrestore(&data->rxlock, flags);
+	spin_unlock_irqrestore(&data->rxlock, flags);
 }
 
 static int btusb_recv_intr(struct btusb_data *data, void *buffer, int count)
 {
-    struct sk_buff *skb;
-    int err = 0;
+	struct sk_buff *skb;
+	int err = 0;
 
-    spin_lock(&data->rxlock);
-    skb = data->evt_skb;
+	spin_lock(&data->rxlock);
+	skb = data->evt_skb;
 
-    while (count) {
-        int len;
+	while (count) {
+		int len;
 
-        if (!skb) {
-            skb = bt_skb_alloc(HCI_MAX_EVENT_SIZE, GFP_ATOMIC);
-            if (!skb) {
-                err = -ENOMEM;
-                break;
-            }
+		if (!skb) {
+			skb = bt_skb_alloc(HCI_MAX_EVENT_SIZE, GFP_ATOMIC);
+			if (!skb) {
+				err = -ENOMEM;
+				break;
+			}
 
-            bt_cb(skb)->pkt_type = HCI_EVENT_PKT;
-            bt_cb(skb)->expect = HCI_EVENT_HDR_SIZE;
-        }
+			bt_cb(skb)->pkt_type = HCI_EVENT_PKT;
+			bt_cb(skb)->expect = HCI_EVENT_HDR_SIZE;
+		}
 
-        len = min_t(uint, bt_cb(skb)->expect, count);
-        memcpy(skb_put(skb, len), buffer, len);
+		len = min_t(uint, bt_cb(skb)->expect, count);
+		memcpy(skb_put(skb, len), buffer, len);
 
-        count -= len;
-        buffer += len;
-        bt_cb(skb)->expect -= len;
+		count -= len;
+		buffer += len;
+		bt_cb(skb)->expect -= len;
 
-        if (skb->len == HCI_EVENT_HDR_SIZE) {
-            /* Complete event header */
-            bt_cb(skb)->expect = hci_event_hdr(skb)->plen;
+		if (skb->len == HCI_EVENT_HDR_SIZE) {
+			/* Complete event header */
+			bt_cb(skb)->expect = hci_event_hdr(skb)->plen;
 
-            if (skb_tailroom(skb) < bt_cb(skb)->expect) {
-                kfree_skb(skb);
-                skb = NULL;
+			if (skb_tailroom(skb) < bt_cb(skb)->expect) {
+				kfree_skb(skb);
+				skb = NULL;
 
-                err = -EILSEQ;
-                break;
-            }
-        }
+				err = -EILSEQ;
+				break;
+			}
+		}
 
-        if (bt_cb(skb)->expect == 0) {
-            /* Complete frame */
-            hci_recv_frame(data->hdev, skb);
-            skb = NULL;
-        }
-    }
+		if (bt_cb(skb)->expect == 0) {
+			/* Complete frame */
+			hci_recv_frame(data->hdev, skb);
+			skb = NULL;
+		}
+	}
 
-    data->evt_skb = skb;
-    spin_unlock(&data->rxlock);
+	data->evt_skb = skb;
+	spin_unlock(&data->rxlock);
 
-    return err;
-}
-#endif
-
-static void rtk_free( struct btusb_data *data)
-{
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 7, 1)
-	kfree(data);
-#endif
-	return;
+	return err;
 }
 
-static struct btusb_data * rtk_alloc(struct usb_interface *intf)
+static int btusb_recv_bulk(struct btusb_data *data, void *buffer, int count)
 {
-	struct btusb_data *data;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 7, 1)
-	data = kzalloc(sizeof(*data), GFP_KERNEL);
-#else
-	data = devm_kzalloc(&intf->dev, sizeof(*data), GFP_KERNEL);
-#endif
-	return data;
+	struct sk_buff *skb;
+	int err = 0;
+
+	spin_lock(&data->rxlock);
+	skb = data->acl_skb;
+
+	while (count) {
+		int len;
+
+		if (!skb) {
+			skb = bt_skb_alloc(HCI_MAX_FRAME_SIZE, GFP_ATOMIC);
+			if (!skb) {
+				err = -ENOMEM;
+				break;
+			}
+
+			bt_cb(skb)->pkt_type = HCI_ACLDATA_PKT;
+			bt_cb(skb)->expect = HCI_ACL_HDR_SIZE;
+		}
+
+		len = min_t(uint, bt_cb(skb)->expect, count);
+		memcpy(skb_put(skb, len), buffer, len);
+
+		count -= len;
+		buffer += len;
+		bt_cb(skb)->expect -= len;
+
+		if (skb->len == HCI_ACL_HDR_SIZE) {
+			__le16 dlen = hci_acl_hdr(skb)->dlen;
+
+			/* Complete ACL header */
+			bt_cb(skb)->expect = __le16_to_cpu(dlen);
+
+			if (skb_tailroom(skb) < bt_cb(skb)->expect) {
+				kfree_skb(skb);
+				skb = NULL;
+
+				err = -EILSEQ;
+				break;
+			}
+		}
+
+		if (bt_cb(skb)->expect == 0) {
+			/* Complete frame */
+			hci_recv_frame(data->hdev, skb);
+			skb = NULL;
+		}
+	}
+
+	data->acl_skb = skb;
+	spin_unlock(&data->rxlock);
+
+	return err;
 }
-MODULE_DEVICE_TABLE(usb, btusb_table);
 
-static int inc_tx(struct btusb_data *data)
+static int btusb_recv_isoc(struct btusb_data *data, void *buffer, int count)
 {
-	unsigned long flags;
-	int rv;
+	struct sk_buff *skb;
+	int err = 0;
 
-	spin_lock_irqsave(&data->txlock, flags);
-	rv = test_bit(BTUSB_SUSPENDING, &data->flags);
-	if (!rv)
-		data->tx_in_flight++;
-	spin_unlock_irqrestore(&data->txlock, flags);
+	spin_lock(&data->rxlock);
+	skb = data->sco_skb;
 
-	return rv;
+	while (count) {
+		int len;
+
+		if (!skb) {
+			skb = bt_skb_alloc(HCI_MAX_SCO_SIZE, GFP_ATOMIC);
+			if (!skb) {
+				err = -ENOMEM;
+				break;
+			}
+
+			bt_cb(skb)->pkt_type = HCI_SCODATA_PKT;
+			bt_cb(skb)->expect = HCI_SCO_HDR_SIZE;
+		}
+
+		len = min_t(uint, bt_cb(skb)->expect, count);
+		memcpy(skb_put(skb, len), buffer, len);
+
+		count -= len;
+		buffer += len;
+		bt_cb(skb)->expect -= len;
+
+		if (skb->len == HCI_SCO_HDR_SIZE) {
+			/* Complete SCO header */
+			bt_cb(skb)->expect = hci_sco_hdr(skb)->dlen;
+
+			if (skb_tailroom(skb) < bt_cb(skb)->expect) {
+				kfree_skb(skb);
+				skb = NULL;
+
+				err = -EILSEQ;
+				break;
+			}
+		}
+
+		if (bt_cb(skb)->expect == 0) {
+			/* Complete frame */
+			hci_recv_frame(data->hdev, skb);
+			skb = NULL;
+		}
+	}
+
+	data->sco_skb = skb;
+	spin_unlock(&data->rxlock);
+
+	return err;
 }
 
 static void btusb_intr_complete(struct urb *urb)
 {
 	struct hci_dev *hdev = urb->context;
-	struct btusb_data *data = GET_DRV_DATA(hdev);
+	struct btusb_data *data = hci_get_drvdata(hdev);
 	int err;
-//	struct usb_device    *dev ;
-//	RTKBT_DBG("btusb_intr_complete %s urb %p status %d count %d ", hdev->name,
-//					urb, urb->status, urb->actual_length);
-//	print_event(urb);
+
+	BT_DBG("%s urb %p status %d count %d", hdev->name, urb, urb->status,
+	       urb->actual_length);
 
 	if (!test_bit(HCI_RUNNING, &hdev->flags))
 		return;
 
-	/*******************************/
-	// Added by Realtek
-	if(!test_bit(BTUSB_NEXT_RX_URB_SUBMITTING, &data->flags))
-		return;
-	/*******************************/
-
+	if (isRTL8723bu) {
+		if(!test_bit(BTUSB_NEXT_RX_URB_SUBMITTING, &data->flags))
+			return;
+	}
 	if (urb->status == 0) {
 		hdev->stat.byte_rx += urb->actual_length;
-#if LINUX_VERSION_CODE > KERNEL_VERSION(3, 18, 0)
-		if (btusb_recv_intr(data, urb->transfer_buffer, urb->actual_length) < 0)
-#else
-		if (hci_recv_fragment(hdev, HCI_EVENT_PKT,
-						urb->transfer_buffer,
-						urb->actual_length) < 0)
-#endif
-		{
-			RTKBT_ERR("%s corrupted event packet", hdev->name);
+
+		if (btusb_recv_intr(data, urb->transfer_buffer,
+				    urb->actual_length) < 0) {
+			BT_ERR("%s corrupted event packet", hdev->name);
 			hdev->stat.err_rx++;
 		}
+	} else if (urb->status == -ENOENT) {
+		/* Avoid suspend failed when usb_kill_urb */
+		return;
 	}
 
 	if (!test_bit(BTUSB_INTR_RUNNING, &data->flags))
@@ -251,23 +431,21 @@ static void btusb_intr_complete(struct urb *urb)
 		/* -EPERM: urb is being killed;
 		 * -ENODEV: device got disconnected */
 		if (err != -EPERM && err != -ENODEV)
-			RTKBT_ERR("btusb_intr_complete %s urb %p failed to resubmit (%d)",
-						hdev->name, urb, -err);
+			BT_ERR("%s urb %p failed to resubmit (%d)",
+			       hdev->name, urb, -err);
 		usb_unanchor_urb(urb);
-	//	dev = urb->dev;
-	//	RTKBT_DBG("dev->state = %d ",dev->state);
 	}
 }
 
 static int btusb_submit_intr_urb(struct hci_dev *hdev, gfp_t mem_flags)
 {
-	struct btusb_data *data = GET_DRV_DATA(hdev);
+	struct btusb_data *data = hci_get_drvdata(hdev);
 	struct urb *urb;
 	unsigned char *buf;
 	unsigned int pipe;
 	int err, size;
 
-	//RTKBT_DBG("%s", hdev->name);
+	BT_DBG("%s", hdev->name);
 
 	if (!data->intr_ep)
 		return -ENODEV;
@@ -287,8 +465,7 @@ static int btusb_submit_intr_urb(struct hci_dev *hdev, gfp_t mem_flags)
 	pipe = usb_rcvintpipe(data->udev, data->intr_ep->bEndpointAddress);
 
 	usb_fill_int_urb(urb, data->udev, pipe, buf, size,
-						btusb_intr_complete, hdev,
-						data->intr_ep->bInterval);
+			 btusb_intr_complete, hdev, data->intr_ep->bInterval);
 
 	urb->transfer_flags |= URB_FREE_BUFFER;
 
@@ -296,8 +473,9 @@ static int btusb_submit_intr_urb(struct hci_dev *hdev, gfp_t mem_flags)
 
 	err = usb_submit_urb(urb, mem_flags);
 	if (err < 0) {
-		RTKBT_ERR("btusb_submit_intr_urb %s urb %p submission failed (%d)",
-						hdev->name, urb, -err);
+		if (err != -EPERM && err != -ENODEV)
+			BT_ERR("%s urb %p submission failed (%d)",
+			       hdev->name, urb, -err);
 		usb_unanchor_urb(urb);
 	}
 
@@ -309,39 +487,32 @@ static int btusb_submit_intr_urb(struct hci_dev *hdev, gfp_t mem_flags)
 static void btusb_bulk_complete(struct urb *urb)
 {
 	struct hci_dev *hdev = urb->context;
-	struct btusb_data *data = GET_DRV_DATA(hdev);
+	struct btusb_data *data = hci_get_drvdata(hdev);
 	int err;
-	//struct usb_device    *dev ;
 
-	/*
-	RTKBT_DBG("%s urb %p status %d count %d", hdev->name,
-					urb, urb->status, urb->actual_length);
-    */
+	BT_DBG("%s urb %p status %d count %d", hdev->name, urb, urb->status,
+	       urb->actual_length);
 
 	if (!test_bit(HCI_RUNNING, &hdev->flags))
 		return;
 
-	/*******************************/
-	// Added by Realtek
-	if(!test_bit(BTUSB_NEXT_RX_URB_SUBMITTING, &data->flags))
-		return;
-	/*******************************/
-
+	if (isRTL8723bu) {
+		if(!test_bit(BTUSB_NEXT_RX_URB_SUBMITTING, &data->flags))
+			return;
+	}
 	if (urb->status == 0) {
 		hdev->stat.byte_rx += urb->actual_length;
-#if LINUX_VERSION_CODE > KERNEL_VERSION(3, 18, 0)
-		if (btusb_recv_intr(data, urb->transfer_buffer, urb->actual_length) < 0)
-#else
-		if (hci_recv_fragment(hdev, HCI_ACLDATA_PKT,
-						urb->transfer_buffer,
-						urb->actual_length) < 0)
-#endif
-		{
-			RTKBT_ERR("%s corrupted ACL packet", hdev->name);
+
+		if (btusb_recv_bulk(data, urb->transfer_buffer,
+				    urb->actual_length) < 0) {
+			BT_ERR("%s corrupted ACL packet", hdev->name);
 			hdev->stat.err_rx++;
 		}
+	} else if (urb->status == -ENOENT) {
+		/* Avoid suspend failed when usb_kill_urb */
+		return;
 	}
-	
+
 	if (!test_bit(BTUSB_BULK_RUNNING, &data->flags))
 		return;
 
@@ -353,23 +524,21 @@ static void btusb_bulk_complete(struct urb *urb)
 		/* -EPERM: urb is being killed;
 		 * -ENODEV: device got disconnected */
 		if (err != -EPERM && err != -ENODEV)
-			RTKBT_ERR("btusb_bulk_complete %s urb %p failed to resubmit (%d)",
-						hdev->name, urb, -err);
+			BT_ERR("%s urb %p failed to resubmit (%d)",
+			       hdev->name, urb, -err);
 		usb_unanchor_urb(urb);
-	//	dev = urb->dev;
-	//	RTKBT_DBG("dev->state = %d ",dev->state);
 	}
 }
 
 static int btusb_submit_bulk_urb(struct hci_dev *hdev, gfp_t mem_flags)
 {
-	struct btusb_data *data = GET_DRV_DATA(hdev);
+	struct btusb_data *data = hci_get_drvdata(hdev);
 	struct urb *urb;
 	unsigned char *buf;
 	unsigned int pipe;
 	int err, size = HCI_MAX_FRAME_SIZE;
 
-	//RTKBT_DBG("%s", hdev->name);
+	BT_DBG("%s", hdev->name);
 
 	if (!data->bulk_rx_ep)
 		return -ENODEV;
@@ -386,8 +555,8 @@ static int btusb_submit_bulk_urb(struct hci_dev *hdev, gfp_t mem_flags)
 
 	pipe = usb_rcvbulkpipe(data->udev, data->bulk_rx_ep->bEndpointAddress);
 
-	usb_fill_bulk_urb(urb, data->udev, pipe,
-					buf, size, btusb_bulk_complete, hdev);
+	usb_fill_bulk_urb(urb, data->udev, pipe, buf, size,
+			  btusb_bulk_complete, hdev);
 
 	urb->transfer_flags |= URB_FREE_BUFFER;
 
@@ -396,8 +565,9 @@ static int btusb_submit_bulk_urb(struct hci_dev *hdev, gfp_t mem_flags)
 
 	err = usb_submit_urb(urb, mem_flags);
 	if (err < 0) {
-		RTKBT_ERR("btusb_submit_bulk_urb %s urb %p submission failed (%d)",
-						hdev->name, urb, -err);
+		if (err != -EPERM && err != -ENODEV)
+			BT_ERR("%s urb %p submission failed (%d)",
+			       hdev->name, urb, -err);
 		usb_unanchor_urb(urb);
 	}
 
@@ -409,13 +579,12 @@ static int btusb_submit_bulk_urb(struct hci_dev *hdev, gfp_t mem_flags)
 static void btusb_isoc_complete(struct urb *urb)
 {
 	struct hci_dev *hdev = urb->context;
-	struct btusb_data *data = GET_DRV_DATA(hdev);
+	struct btusb_data *data = hci_get_drvdata(hdev);
 	int i, err;
 
-	/*
-	RTKBT_DBG("%s urb %p status %d count %d", hdev->name,
-					urb, urb->status, urb->actual_length);
-    */
+	BT_DBG("%s urb %p status %d count %d", hdev->name, urb, urb->status,
+	       urb->actual_length);
+
 	if (!test_bit(HCI_RUNNING, &hdev->flags))
 		return;
 
@@ -428,18 +597,16 @@ static void btusb_isoc_complete(struct urb *urb)
 				continue;
 
 			hdev->stat.byte_rx += length;
-#if LINUX_VERSION_CODE > KERNEL_VERSION(3, 18, 0)
-			if (btusb_recv_intr(data, urb->transfer_buffer, urb->actual_length) < 0)
-#else
-			if (hci_recv_fragment(hdev, HCI_SCODATA_PKT,
-						urb->transfer_buffer + offset,
-								length) < 0)
-#endif
-			{
-				RTKBT_ERR("%s corrupted SCO packet", hdev->name);
+
+			if (btusb_recv_isoc(data, urb->transfer_buffer + offset,
+					    length) < 0) {
+				BT_ERR("%s corrupted SCO packet", hdev->name);
 				hdev->stat.err_rx++;
 			}
 		}
+	} else if (urb->status == -ENOENT) {
+		/* Avoid suspend failed when usb_kill_urb */
+		return;
 	}
 
 	if (!test_bit(BTUSB_ISOC_RUNNING, &data->flags))
@@ -452,8 +619,8 @@ static void btusb_isoc_complete(struct urb *urb)
 		/* -EPERM: urb is being killed;
 		 * -ENODEV: device got disconnected */
 		if (err != -EPERM && err != -ENODEV)
-			RTKBT_ERR("btusb_isoc_complete %s urb %p failed to resubmit (%d)",
-						hdev->name, urb, -err);
+			BT_ERR("%s urb %p failed to resubmit (%d)",
+			       hdev->name, urb, -err);
 		usb_unanchor_urb(urb);
 	}
 }
@@ -462,7 +629,7 @@ static inline void __fill_isoc_descriptor(struct urb *urb, int len, int mtu)
 {
 	int i, offset = 0;
 
-	//RTKBT_DBG("len %d mtu %d", len, mtu);
+	BT_DBG("len %d mtu %d", len, mtu);
 
 	for (i = 0; i < BTUSB_MAX_ISOC_FRAMES && len >= mtu;
 					i++, offset += mtu, len -= mtu) {
@@ -481,13 +648,13 @@ static inline void __fill_isoc_descriptor(struct urb *urb, int len, int mtu)
 
 static int btusb_submit_isoc_urb(struct hci_dev *hdev, gfp_t mem_flags)
 {
-	struct btusb_data *data = GET_DRV_DATA(hdev);
+	struct btusb_data *data = hci_get_drvdata(hdev);
 	struct urb *urb;
 	unsigned char *buf;
 	unsigned int pipe;
 	int err, size;
 
-	//RTKBT_DBG("%s", hdev->name);
+	BT_DBG("%s", hdev->name);
 
 	if (!data->isoc_rx_ep)
 		return -ENODEV;
@@ -507,25 +674,21 @@ static int btusb_submit_isoc_urb(struct hci_dev *hdev, gfp_t mem_flags)
 
 	pipe = usb_rcvisocpipe(data->udev, data->isoc_rx_ep->bEndpointAddress);
 
-	urb->dev      = data->udev;
-	urb->pipe     = pipe;
-	urb->context  = hdev;
-	urb->complete = btusb_isoc_complete;
-	urb->interval = data->isoc_rx_ep->bInterval;
+	usb_fill_int_urb(urb, data->udev, pipe, buf, size, btusb_isoc_complete,
+			 hdev, data->isoc_rx_ep->bInterval);
 
-	urb->transfer_flags  = URB_FREE_BUFFER | URB_ISO_ASAP;
-	urb->transfer_buffer = buf;
-	urb->transfer_buffer_length = size;
+	urb->transfer_flags = URB_FREE_BUFFER | URB_ISO_ASAP;
 
 	__fill_isoc_descriptor(urb, size,
-			le16_to_cpu(data->isoc_rx_ep->wMaxPacketSize));
+			       le16_to_cpu(data->isoc_rx_ep->wMaxPacketSize));
 
 	usb_anchor_urb(urb, &data->isoc_anchor);
 
 	err = usb_submit_urb(urb, mem_flags);
 	if (err < 0) {
-		RTKBT_ERR("btusb_submit_isoc_urb %s urb %p submission failed (%d)",
-						hdev->name, urb, -err);
+		if (err != -EPERM && err != -ENODEV)
+			BT_ERR("%s urb %p submission failed (%d)",
+			       hdev->name, urb, -err);
 		usb_unanchor_urb(urb);
 	}
 
@@ -537,11 +700,11 @@ static int btusb_submit_isoc_urb(struct hci_dev *hdev, gfp_t mem_flags)
 static void btusb_tx_complete(struct urb *urb)
 {
 	struct sk_buff *skb = urb->context;
-	struct hci_dev *hdev = (struct hci_dev *) skb->dev;
-	struct btusb_data *data = GET_DRV_DATA(hdev);
+	struct hci_dev *hdev = (struct hci_dev *)skb->dev;
+	struct btusb_data *data = hci_get_drvdata(hdev);
 
-//	RTKBT_DBG("btusb_tx_complete %s urb %p status %d count %d", hdev->name,
-//					urb, urb->status, urb->actual_length);
+	BT_DBG("%s urb %p status %d count %d", hdev->name, urb, urb->status,
+	       urb->actual_length);
 
 	if (!test_bit(HCI_RUNNING, &hdev->flags))
 		goto done;
@@ -564,12 +727,11 @@ done:
 static void btusb_isoc_tx_complete(struct urb *urb)
 {
 	struct sk_buff *skb = urb->context;
-	struct hci_dev *hdev = (struct hci_dev *) skb->dev;
+	struct hci_dev *hdev = (struct hci_dev *)skb->dev;
 
-	/*
-	RTKBT_DBG("btusb_isoc_tx_complete %s urb %p status %d count %d", hdev->name,
-					urb, urb->status, urb->actual_length);
-    */
+	BT_DBG("%s urb %p status %d count %d", hdev->name, urb, urb->status,
+	       urb->actual_length);
+
 	if (!test_bit(HCI_RUNNING, &hdev->flags))
 		goto done;
 
@@ -586,31 +748,26 @@ done:
 
 static int btusb_open(struct hci_dev *hdev)
 {
-	struct btusb_data *data = GET_DRV_DATA(hdev);
+	struct btusb_data *data = hci_get_drvdata(hdev);
 	int err;
+
+	BT_DBG("%s", hdev->name);
 
 	err = usb_autopm_get_interface(data->intf);
 	if (err < 0)
 		return err;
 
 	data->intf->needs_remote_wakeup = 1;
-	RTKBT_DBG("%s start pm_usage_cnt(0x%x)",__FUNCTION__,atomic_read(&(data->intf ->pm_usage_cnt)));
 
-	/*******************************/
-	if (0 == atomic_read(&hdev->promisc))
-	{
-		RTKBT_ERR("btusb_open hdev->promisc ==0");
-		err = -1;
-                //goto failed;
+	if (isRTL8723bu) {
+		if (0 == atomic_read(&hdev->promisc)) {
+			BT_ERR("btusb_open hdev->promisc ==0");
+			err = -1;
+		}
+		if ((err = download_patch(data->intf)) < 0)
+			goto failed;
+		set_bit(BTUSB_NEXT_RX_URB_SUBMITTING, &data->flags);
 	}
-	err = download_patch(data->intf);
-	if (err < 0) goto failed;
-	/*******************************/
-
-	/*******************************/
-	// Added by Realtek
-	set_bit(BTUSB_NEXT_RX_URB_SUBMITTING, &data->flags);
-	/*******************************/
 
 	if (test_and_set_bit(HCI_RUNNING, &hdev->flags))
 		goto done;
@@ -624,7 +781,8 @@ static int btusb_open(struct hci_dev *hdev)
 
 	err = btusb_submit_bulk_urb(hdev, GFP_KERNEL);
 	if (err < 0) {
-		mdelay(URB_CANCELING_DELAY_MS);      // Added by Realtek
+		if (isRTL8723bu)
+			mdelay(URB_CANCELING_DELAY_MS);
 		usb_kill_anchored_urbs(&data->intr_anchor);
 		goto failed;
 	}
@@ -634,21 +792,19 @@ static int btusb_open(struct hci_dev *hdev)
 
 done:
 	usb_autopm_put_interface(data->intf);
-	RTKBT_DBG("%s end  pm_usage_cnt(0x%x)",__FUNCTION__,atomic_read(&(data->intf ->pm_usage_cnt)));
-
 	return 0;
 
 failed:
 	clear_bit(BTUSB_INTR_RUNNING, &data->flags);
 	clear_bit(HCI_RUNNING, &hdev->flags);
 	usb_autopm_put_interface(data->intf);
-	RTKBT_ERR("%s failed  pm_usage_cnt(0x%x)",__FUNCTION__,atomic_read(&(data->intf ->pm_usage_cnt)));
 	return err;
 }
 
 static void btusb_stop_traffic(struct btusb_data *data)
 {
-	mdelay(URB_CANCELING_DELAY_MS);    // Added by Realtek
+	if (isRTL8723bu)
+		mdelay(URB_CANCELING_DELAY_MS);
 	usb_kill_anchored_urbs(&data->intr_anchor);
 	usb_kill_anchored_urbs(&data->bulk_anchor);
 	usb_kill_anchored_urbs(&data->isoc_anchor);
@@ -656,37 +812,36 @@ static void btusb_stop_traffic(struct btusb_data *data)
 
 static int btusb_close(struct hci_dev *hdev)
 {
-	struct btusb_data *data = GET_DRV_DATA(hdev);
-	int i,err;
+	struct btusb_data *data = hci_get_drvdata(hdev);
+	int err;
+
+	BT_DBG("%s", hdev->name);
 
 	if (!test_and_clear_bit(HCI_RUNNING, &hdev->flags))
 		return 0;
 
-	RTKBT_DBG("btusb_close");
-	/*******************************/
-	for (i = 0; i < NUM_REASSEMBLY; i++)
-	{
-		if(hdev->reassembly[i])
-		{
-			kfree_skb(hdev->reassembly[i]);
-			hdev->reassembly[i] = NULL;
-			RTKBT_DBG("%s free ressembly i=%d",__FUNCTION__,i);
+	if (isRTL8723bu) {
+		int i;
+		for (i = 0; i < NUM_REASSEMBLY; i++) {
+			if(hdev->reassembly[i]) {
+				kfree_skb(hdev->reassembly[i]);
+				hdev->reassembly[i] = NULL;
+				BT_DBG("%s free ressembly i=%d",__FUNCTION__,i);
+			}
 		}
 	}
-	/*******************************/
 	cancel_work_sync(&data->work);
 	cancel_work_sync(&data->waker);
 
-	/*******************************/
-	// Added by Realtek
-	clear_bit(BTUSB_NEXT_RX_URB_SUBMITTING, &data->flags);
-	/*******************************/
-
+	if (isRTL8723bu)
+		clear_bit(BTUSB_NEXT_RX_URB_SUBMITTING, &data->flags);
 	clear_bit(BTUSB_ISOC_RUNNING, &data->flags);
 	clear_bit(BTUSB_BULK_RUNNING, &data->flags);
 	clear_bit(BTUSB_INTR_RUNNING, &data->flags);
 
 	btusb_stop_traffic(data);
+	btusb_free_frags(data);
+
 	err = usb_autopm_get_interface(data->intf);
 	if (err < 0)
 		goto failed;
@@ -695,170 +850,211 @@ static int btusb_close(struct hci_dev *hdev)
 	usb_autopm_put_interface(data->intf);
 
 failed:
-	mdelay(URB_CANCELING_DELAY_MS);     // Added by Realtek
+	if (isRTL8723bu)
+		mdelay(URB_CANCELING_DELAY_MS);
 	usb_scuttle_anchored_urbs(&data->deferred);
 	return 0;
 }
 
 static int btusb_flush(struct hci_dev *hdev)
 {
-	struct btusb_data *data = GET_DRV_DATA(hdev);
+	struct btusb_data *data = hci_get_drvdata(hdev);
 
-	RTKBT_DBG("%s add delay ",__FUNCTION__);
-	mdelay(URB_CANCELING_DELAY_MS);     // Added by Realtek
+	BT_DBG("%s", hdev->name);
+
+	if (isRTL8723bu)
+		mdelay(URB_CANCELING_DELAY_MS);
 	usb_kill_anchored_urbs(&data->tx_anchor);
+	btusb_free_frags(data);
 
 	return 0;
 }
 
-#if LINUX_VERSION_CODE >=KERNEL_VERSION(3, 13, 0)
-static int btusb_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
+static struct urb *alloc_ctrl_urb(struct hci_dev *hdev, struct sk_buff *skb)
 {
-#else
-static int btusb_send_frame(struct sk_buff *skb)
-{
-	struct hci_dev *hdev = (struct hci_dev *) skb->dev;
-#endif
-
-	struct btusb_data *data = GET_DRV_DATA(hdev);
+	struct btusb_data *data = hci_get_drvdata(hdev);
 	struct usb_ctrlrequest *dr;
 	struct urb *urb;
 	unsigned int pipe;
+
+	urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!urb)
+		return ERR_PTR(-ENOMEM);
+
+	dr = kmalloc(sizeof(*dr), GFP_KERNEL);
+	if (!dr) {
+		usb_free_urb(urb);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	dr->bRequestType = data->cmdreq_type;
+	dr->bRequest     = 0;
+	dr->wIndex       = 0;
+	dr->wValue       = 0;
+	dr->wLength      = __cpu_to_le16(skb->len);
+
+	pipe = usb_sndctrlpipe(data->udev, 0x00);
+
+	usb_fill_control_urb(urb, data->udev, pipe, (void *)dr,
+			     skb->data, skb->len, btusb_tx_complete, skb);
+
+	skb->dev = (void *)hdev;
+
+	return urb;
+}
+
+static struct urb *alloc_bulk_urb(struct hci_dev *hdev, struct sk_buff *skb)
+{
+	struct btusb_data *data = hci_get_drvdata(hdev);
+	struct urb *urb;
+	unsigned int pipe;
+
+	if (!data->bulk_tx_ep)
+		return ERR_PTR(-ENODEV);
+
+	urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!urb)
+		return ERR_PTR(-ENOMEM);
+
+	pipe = usb_sndbulkpipe(data->udev, data->bulk_tx_ep->bEndpointAddress);
+
+	usb_fill_bulk_urb(urb, data->udev, pipe,
+			  skb->data, skb->len, btusb_tx_complete, skb);
+
+	skb->dev = (void *)hdev;
+
+	return urb;
+}
+
+static struct urb *alloc_isoc_urb(struct hci_dev *hdev, struct sk_buff *skb)
+{
+	struct btusb_data *data = hci_get_drvdata(hdev);
+	struct urb *urb;
+	unsigned int pipe;
+
+	if (!data->isoc_tx_ep)
+		return ERR_PTR(-ENODEV);
+
+	urb = usb_alloc_urb(BTUSB_MAX_ISOC_FRAMES, GFP_KERNEL);
+	if (!urb)
+		return ERR_PTR(-ENOMEM);
+
+	pipe = usb_sndisocpipe(data->udev, data->isoc_tx_ep->bEndpointAddress);
+
+	usb_fill_int_urb(urb, data->udev, pipe,
+			 skb->data, skb->len, btusb_isoc_tx_complete,
+			 skb, data->isoc_tx_ep->bInterval);
+
+	urb->transfer_flags  = URB_ISO_ASAP;
+
+	__fill_isoc_descriptor(urb, skb->len,
+			       le16_to_cpu(data->isoc_tx_ep->wMaxPacketSize));
+
+	skb->dev = (void *)hdev;
+
+	return urb;
+}
+
+static int submit_tx_urb(struct hci_dev *hdev, struct urb *urb)
+{
+	struct btusb_data *data = hci_get_drvdata(hdev);
 	int err;
 
-//	RTKBT_DBG("%s", hdev->name);
-
-	if (!test_bit(HCI_RUNNING, &hdev->flags))
-		return -EBUSY;
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 13, 0)
-#else
-skb->dev = (void *) hdev;
-#endif
-
-	switch (bt_cb(skb)->pkt_type) {
-	case HCI_COMMAND_PKT:
-		print_command(skb);
-		urb = usb_alloc_urb(0, GFP_ATOMIC);
-		if (!urb)
-			return -ENOMEM;
-
-		dr = kmalloc(sizeof(*dr), GFP_ATOMIC);
-		if (!dr) {
-			usb_free_urb(urb);
-			return -ENOMEM;
-		}
-
-		dr->bRequestType = data->cmdreq_type;
-		dr->bRequest     = 0;
-		dr->wIndex       = 0;
-		dr->wValue       = 0;
-		dr->wLength      = __cpu_to_le16(skb->len);
-
-		pipe = usb_sndctrlpipe(data->udev, 0x00);
-
-		usb_fill_control_urb(urb, data->udev, pipe, (void *) dr,
-				skb->data, skb->len, btusb_tx_complete, skb);
-
-		hdev->stat.cmd_tx++;
-		break;
-
-	case HCI_ACLDATA_PKT:
-		print_acl(skb,1);
-		if (!data->bulk_tx_ep)
-			return -ENODEV;
-
-		urb = usb_alloc_urb(0, GFP_ATOMIC);
-		if (!urb)
-			return -ENOMEM;
-
-		pipe = usb_sndbulkpipe(data->udev,
-					data->bulk_tx_ep->bEndpointAddress);
-
-		usb_fill_bulk_urb(urb, data->udev, pipe,
-				skb->data, skb->len, btusb_tx_complete, skb);
-
-		hdev->stat.acl_tx++;
-		break;
-
-	case HCI_SCODATA_PKT:
-		if (!data->isoc_tx_ep ||SCO_NUM< 1)
-			return -ENODEV;
-
-		urb = usb_alloc_urb(BTUSB_MAX_ISOC_FRAMES, GFP_ATOMIC);
-		if (!urb)
-			return -ENOMEM;
-
-		pipe = usb_sndisocpipe(data->udev,
-					data->isoc_tx_ep->bEndpointAddress);
-
-		usb_fill_int_urb(urb, data->udev, pipe,
-				skb->data, skb->len, btusb_isoc_tx_complete,
-				skb, data->isoc_tx_ep->bInterval);
-
-		urb->transfer_flags  = URB_ISO_ASAP;
-
-		__fill_isoc_descriptor(urb, skb->len,
-				le16_to_cpu(data->isoc_tx_ep->wMaxPacketSize));
-
-		hdev->stat.sco_tx++;
-		goto skip_waking;
-
-	default:
-		return -EILSEQ;
-	}
-
-	err = inc_tx(data);
-	if (err) {
-		usb_anchor_urb(urb, &data->deferred);
-		schedule_work(&data->waker);
-		err = 0;
-		goto done;
-	}
-
-skip_waking:
 	usb_anchor_urb(urb, &data->tx_anchor);
-	err = usb_submit_urb(urb, GFP_ATOMIC);
+
+	err = usb_submit_urb(urb, GFP_KERNEL);
 	if (err < 0) {
-		RTKBT_ERR("btusb_send_frame %s urb %p submission failed", hdev->name, urb);
+		if (err != -EPERM && err != -ENODEV)
+			BT_ERR("%s urb %p submission failed (%d)",
+			       hdev->name, urb, -err);
 		kfree(urb->setup_packet);
 		usb_unanchor_urb(urb);
 	} else {
 		usb_mark_last_busy(data->udev);
 	}
-	usb_free_urb(urb);
 
-done:
+	usb_free_urb(urb);
 	return err;
 }
 
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 4, 0)
-static void btusb_destruct(struct hci_dev *hdev)
+static int submit_or_queue_tx_urb(struct hci_dev *hdev, struct urb *urb)
 {
-	RTKBT_DBG("btusb_destruct %s", hdev->name);
-	hci_free_dev(hdev);
+	struct btusb_data *data = hci_get_drvdata(hdev);
+	unsigned long flags;
+	bool suspending;
+
+	spin_lock_irqsave(&data->txlock, flags);
+	suspending = test_bit(BTUSB_SUSPENDING, &data->flags);
+	if (!suspending)
+		data->tx_in_flight++;
+	spin_unlock_irqrestore(&data->txlock, flags);
+
+	if (!suspending)
+		return submit_tx_urb(hdev, urb);
+
+	usb_anchor_urb(urb, &data->deferred);
+	schedule_work(&data->waker);
+
+	usb_free_urb(urb);
+	return 0;
 }
-#endif
 
+static int btusb_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
+{
+	struct urb *urb;
 
+	BT_DBG("%s", hdev->name);
+
+	if (!test_bit(HCI_RUNNING, &hdev->flags))
+		return -EBUSY;
+
+	switch (bt_cb(skb)->pkt_type) {
+	case HCI_COMMAND_PKT:
+		urb = alloc_ctrl_urb(hdev, skb);
+		if (IS_ERR(urb))
+			return PTR_ERR(urb);
+
+		hdev->stat.cmd_tx++;
+		return submit_or_queue_tx_urb(hdev, urb);
+
+	case HCI_ACLDATA_PKT:
+		urb = alloc_bulk_urb(hdev, skb);
+		if (IS_ERR(urb))
+			return PTR_ERR(urb);
+
+		hdev->stat.acl_tx++;
+		return submit_or_queue_tx_urb(hdev, urb);
+
+	case HCI_SCODATA_PKT:
+		if (hci_conn_num(hdev, SCO_LINK) < 1)
+			return -ENODEV;
+
+		urb = alloc_isoc_urb(hdev, skb);
+		if (IS_ERR(urb))
+			return PTR_ERR(urb);
+
+		hdev->stat.sco_tx++;
+		return submit_tx_urb(hdev, urb);
+	}
+
+	return -EILSEQ;
+}
 
 static void btusb_notify(struct hci_dev *hdev, unsigned int evt)
 {
-	struct btusb_data *data = GET_DRV_DATA(hdev);
+	struct btusb_data *data = hci_get_drvdata(hdev);
 
-	RTKBT_DBG("%s evt %d", hdev->name, evt);
-	RTKBT_DBG("btusb_notify : %s evt %d", hdev->name, evt);
+	BT_DBG("%s evt %d", hdev->name, evt);
 
-	if (SCO_NUM != data->sco_num) {
-		data->sco_num = SCO_NUM;
+	if (hci_conn_num(hdev, SCO_LINK) != data->sco_num) {
+		data->sco_num = hci_conn_num(hdev, SCO_LINK);
 		schedule_work(&data->work);
 	}
 }
 
 static inline int __set_isoc_interface(struct hci_dev *hdev, int altsetting)
 {
-	struct btusb_data *data = GET_DRV_DATA(hdev);
+	struct btusb_data *data = hci_get_drvdata(hdev);
 	struct usb_interface *intf = data->isoc;
 	struct usb_endpoint_descriptor *ep_desc;
 	int i, err;
@@ -868,7 +1064,7 @@ static inline int __set_isoc_interface(struct hci_dev *hdev, int altsetting)
 
 	err = usb_set_interface(data->udev, 1, altsetting);
 	if (err < 0) {
-		RTKBT_ERR("%s setting interface failed (%d)", hdev->name, -err);
+		BT_ERR("%s setting interface failed (%d)", hdev->name, -err);
 		return err;
 	}
 
@@ -892,7 +1088,7 @@ static inline int __set_isoc_interface(struct hci_dev *hdev, int altsetting)
 	}
 
 	if (!data->isoc_tx_ep || !data->isoc_rx_ep) {
-		RTKBT_ERR("%s invalid SCO descriptors", hdev->name);
+		BT_ERR("%s invalid SCO descriptors", hdev->name);
 		return -ENODEV;
 	}
 
@@ -903,35 +1099,35 @@ static void btusb_work(struct work_struct *work)
 {
 	struct btusb_data *data = container_of(work, struct btusb_data, work);
 	struct hci_dev *hdev = data->hdev;
-	int err;
 	int new_alts;
+	int err;
+
 	if (data->sco_num > 0) {
 		if (!test_bit(BTUSB_DID_ISO_RESUME, &data->flags)) {
 			err = usb_autopm_get_interface(data->isoc ? data->isoc : data->intf);
 			if (err < 0) {
 				clear_bit(BTUSB_ISOC_RUNNING, &data->flags);
-				mdelay(URB_CANCELING_DELAY_MS);    // Added by Realtek
+				if (isRTL8723bu)
+					mdelay(URB_CANCELING_DELAY_MS);
 				usb_kill_anchored_urbs(&data->isoc_anchor);
 				return;
 			}
 
 			set_bit(BTUSB_DID_ISO_RESUME, &data->flags);
 		}
-#if LINUX_VERSION_CODE > KERNEL_VERSION(3, 7, 1)
+
 		if (hdev->voice_setting & 0x0020) {
 			static const int alts[3] = { 2, 4, 5 };
+
 			new_alts = alts[data->sco_num - 1];
 		} else {
 			new_alts = data->sco_num;
 		}
-		if (data->isoc_altsetting != new_alts) {
-#else
-		if (data->isoc_altsetting != 2) {
-			new_alts = 2;
-#endif
 
+		if (data->isoc_altsetting != new_alts) {
 			clear_bit(BTUSB_ISOC_RUNNING, &data->flags);
-			mdelay(URB_CANCELING_DELAY_MS);    // Added by Realtek
+			if (isRTL8723bu)
+				mdelay(URB_CANCELING_DELAY_MS);
 			usb_kill_anchored_urbs(&data->isoc_anchor);
 
 			if (__set_isoc_interface(hdev, new_alts) < 0)
@@ -946,7 +1142,8 @@ static void btusb_work(struct work_struct *work)
 		}
 	} else {
 		clear_bit(BTUSB_ISOC_RUNNING, &data->flags);
-		mdelay(URB_CANCELING_DELAY_MS);      // Added by Realtek
+		if (isRTL8723bu)
+			mdelay(URB_CANCELING_DELAY_MS);
 		usb_kill_anchored_urbs(&data->isoc_anchor);
 
 		__set_isoc_interface(hdev, 0);
@@ -961,49 +1158,54 @@ static void btusb_waker(struct work_struct *work)
 	int err;
 
 	err = usb_autopm_get_interface(data->intf);
-	RTKBT_DBG("%s start  pm_usage_cnt(0x%x)",__FUNCTION__,atomic_read(&(data->intf ->pm_usage_cnt)));
 	if (err < 0)
 		return;
 
 	usb_autopm_put_interface(data->intf);
-	RTKBT_DBG("%s end  pm_usage_cnt(0x%x)",__FUNCTION__,atomic_read(&(data->intf ->pm_usage_cnt)));
 }
 
 static int btusb_probe(struct usb_interface *intf,
-				const struct usb_device_id *id)
+		       const struct usb_device_id *id)
 {
 	struct usb_endpoint_descriptor *ep_desc;
 	struct btusb_data *data;
 	struct hci_dev *hdev;
-	int i, err,flag1,flag2;
-	struct usb_device *udev;
-	udev = interface_to_usbdev(intf);
+	int i, err;
 
-
-	RTKBT_DBG("btusb_probe intf->cur_altsetting->desc.bInterfaceNumber=%d",intf->cur_altsetting->desc.bInterfaceNumber);
+	BT_DBG("intf %p id %p", intf, id);
 
 	/* interface numbers are hardcoded in the spec */
 	if (intf->cur_altsetting->desc.bInterfaceNumber != 0)
 		return -ENODEV;
 
-	/*******************************/
-	flag1=device_can_wakeup(&udev->dev);
-	flag2=device_may_wakeup(&udev->dev);
-	RTKBT_DBG("btusb_probe can_wakeup=%x	 flag2=%x",flag1,flag2);
-	//device_wakeup_enable(&udev->dev);
-	/*device_wakeup_disable(&udev->dev);
-	flag1=device_can_wakeup(&udev->dev);
-	flag2=device_may_wakeup(&udev->dev);
-	RTKBT_DBG("btusb_probe can_wakeup=%x	 flag2=%x",flag1,flag2);
-	*/
-	err = patch_add(intf);
-	if (err < 0) return -1;
-	/*******************************/
+	if (!id->driver_info) {
+		const struct usb_device_id *match;
 
-	data = rtk_alloc(intf);
+		match = usb_match_id(intf, blacklist_table);
+		if (match)
+			id = match;
+	}
+
+	if (id->driver_info == BTUSB_IGNORE)
+		return -ENODEV;
+
+	isRTL8723bu = false;
+	if (id->driver_info == BTUSB_REALTEK) {
+		isRTL8723bu = true;
+	}
+
+	if (isRTL8723bu) {
+		struct usb_device *udev = interface_to_usbdev(intf);
+		int flag1 = device_can_wakeup(&udev->dev);
+		int flag2 = device_may_wakeup(&udev->dev);
+		BT_DBG("btusb_probe can_wakeup=%x     flag2=%x",flag1, flag2);
+		if (patch_add (intf) < 0)
+			return -1;
+	}
+
+	data = devm_kzalloc(&intf->dev, sizeof(*data), GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
-
 
 	for (i = 0; i < intf->cur_altsetting->desc.bNumEndpoints; i++) {
 		ep_desc = &intf->cur_altsetting->endpoint[i].desc;
@@ -1024,70 +1226,74 @@ static int btusb_probe(struct usb_interface *intf,
 		}
 	}
 
-	if (!data->intr_ep || !data->bulk_tx_ep || !data->bulk_rx_ep) {
-		rtk_free(data);
+	if (!data->intr_ep || !data->bulk_tx_ep || !data->bulk_rx_ep)
 		return -ENODEV;
-	}
 
 	data->cmdreq_type = USB_TYPE_CLASS;
 
 	data->udev = interface_to_usbdev(intf);
 	data->intf = intf;
 
-	spin_lock_init(&data->lock);
-
 	INIT_WORK(&data->work, btusb_work);
 	INIT_WORK(&data->waker, btusb_waker);
+	init_usb_anchor(&data->deferred);
+	init_usb_anchor(&data->tx_anchor);
 	spin_lock_init(&data->txlock);
 
-	init_usb_anchor(&data->tx_anchor);
 	init_usb_anchor(&data->intr_anchor);
 	init_usb_anchor(&data->bulk_anchor);
 	init_usb_anchor(&data->isoc_anchor);
-	init_usb_anchor(&data->deferred);
+	spin_lock_init(&data->rxlock);
 
 	hdev = hci_alloc_dev();
-	if (!hdev) {
-		rtk_free(data);
+	if (!hdev)
 		return -ENOMEM;
-	}
 
-	HDEV_BUS = HCI_USB;
+	hdev->bus = HCI_USB;
+	hci_set_drvdata(hdev, data);
 
 	data->hdev = hdev;
 
 	SET_HCIDEV_DEV(hdev, &intf->dev);
 
-	hdev->open     = btusb_open;
-	hdev->close    = btusb_close;
-	hdev->flush    = btusb_flush;
-	hdev->send     = btusb_send_frame;
-	hdev->notify   = btusb_notify;
-
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 4, 0)
-	hci_set_drvdata(hdev, data);
-#else
-	hdev->driver_data = data;
-	hdev->destruct = btusb_destruct;
-	hdev->owner = THIS_MODULE;
-#endif
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 7, 1)
-	if (!reset)
-		set_bit(HCI_QUIRK_RESET_ON_CLOSE, &hdev->quirks);
-	RTKBT_DBG("set_bit(HCI_QUIRK_RESET_ON_CLOSE, &hdev->quirks);");
-#endif
+	hdev->open   = btusb_open;
+	hdev->close  = btusb_close;
+	hdev->flush  = btusb_flush;
+	hdev->send   = btusb_send_frame;
+	hdev->notify = btusb_notify;
 
 	/* Interface numbers are hardcoded in the specification */
 	data->isoc = usb_ifnum_to_if(data->udev, 1);
 
+	if (!reset)
+		set_bit(HCI_QUIRK_RESET_ON_CLOSE, &hdev->quirks);
+
+	if (force_scofix || id->driver_info & BTUSB_WRONG_SCO_MTU) {
+		if (!disable_scofix)
+			set_bit(HCI_QUIRK_FIXUP_BUFFER_SIZE, &hdev->quirks);
+	}
+
+	if (id->driver_info & BTUSB_BROKEN_ISOC)
+		data->isoc = NULL;
+
+	if (id->driver_info & BTUSB_DIGIANSWER) {
+		data->cmdreq_type = USB_TYPE_VENDOR;
+		set_bit(HCI_QUIRK_RESET_ON_CLOSE, &hdev->quirks);
+	}
+
+	if (id->driver_info & BTUSB_SNIFFER) {
+		struct usb_device *udev = data->udev;
+
+		/* New sniffer firmware has crippled HCI interface */
+		if (le16_to_cpu(udev->descriptor.bcdDevice) > 0x997)
+			set_bit(HCI_QUIRK_RAW_DEVICE, &hdev->quirks);
+	}
+
 	if (data->isoc) {
 		err = usb_driver_claim_interface(&btusb_driver,
-							data->isoc, data);
+						 data->isoc, data);
 		if (err < 0) {
 			hci_free_dev(hdev);
-			rtk_free(data);
 			return err;
 		}
 	}
@@ -1095,15 +1301,11 @@ static int btusb_probe(struct usb_interface *intf,
 	err = hci_register_dev(hdev);
 	if (err < 0) {
 		hci_free_dev(hdev);
-		rtk_free(data);
 		return err;
 	}
 
 	usb_set_intfdata(intf, data);
 
-#if CONFIG_BLUEDROID //for 4.2
-	btfcd_init();
-#endif
 	return 0;
 }
 
@@ -1111,27 +1313,17 @@ static void btusb_disconnect(struct usb_interface *intf)
 {
 	struct btusb_data *data = usb_get_intfdata(intf);
 	struct hci_dev *hdev;
-	struct usb_device *udev;
-	udev = interface_to_usbdev(intf);
 
-	if (intf->cur_altsetting->desc.bInterfaceNumber != 0)
-		return;
+	BT_DBG("intf %p", intf);
 
 	if (!data)
 		return;
 
-	RTKBT_DBG("btusb_disconnect");
-	/*******************************/
-	patch_remove(intf);
-	/*******************************/
+	if (isRTL8723bu) {
+		patch_remove (intf);
+	}
 
 	hdev = data->hdev;
-#if CONFIG_BLUEDROID //for 4.2
-#else //for bluez
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 4, 0)
-	__hci_dev_hold(hdev);
-#endif
-#endif
 	usb_set_intfdata(data->intf, NULL);
 
 	if (data->isoc)
@@ -1144,20 +1336,8 @@ static void btusb_disconnect(struct usb_interface *intf)
 	else if (data->isoc)
 		usb_driver_release_interface(&btusb_driver, data->isoc);
 
-#if CONFIG_BLUEDROID //for 4.2
-#else //for bluez
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 4, 0)
-	__hci_dev_put(hdev);
-#endif
-#endif
-
+	btusb_free_frags(data);
 	hci_free_dev(hdev);
-	rtk_free(data);
-
-#if CONFIG_BLUEDROID //for 4.2
-	btfcd_exit();
-#endif
-
 }
 
 #ifdef CONFIG_PM
@@ -1165,23 +1345,19 @@ static int btusb_suspend(struct usb_interface *intf, pm_message_t message)
 {
 	struct btusb_data *data = usb_get_intfdata(intf);
 
-	if (intf->cur_altsetting->desc.bInterfaceNumber != 0)
-		return 0;
+	BT_DBG("intf %p", intf);
 
-	/*******************************/
-	RTKBT_DBG("btusb_suspend message.event=0x%x,data->suspend_count=%d",message.event,data->suspend_count);
-	if (!test_bit(HCI_RUNNING, &data->hdev->flags))
-	{
-		RTKBT_DBG("btusb_suspend-----bt is off");
-		set_btoff(data->intf);
+	if (isRTL8723bu) {
+		if (!test_bit(HCI_RUNNING, &data->hdev->flags)) {
+			BT_DBG("btusb_suspend-----bt is off");
+			set_btoff(data->intf);
+		}
 	}
-	/*******************************/
-
 	if (data->suspend_count++)
 		return 0;
 
 	spin_lock_irq(&data->txlock);
-	if (!((message.event & PM_EVENT_AUTO) && data->tx_in_flight)) {
+	if (!(PMSG_IS_AUTO(message) && data->tx_in_flight)) {
 		set_bit(BTUSB_SUSPENDING, &data->flags);
 		spin_unlock_irq(&data->txlock);
 	} else {
@@ -1191,14 +1367,13 @@ static int btusb_suspend(struct usb_interface *intf, pm_message_t message)
 	}
 
 	cancel_work_sync(&data->work);
-
-	/*******************************/
-	// Added by Realtek
-	clear_bit(BTUSB_NEXT_RX_URB_SUBMITTING, &data->flags);
-	/*******************************/
+	if (isRTL8723bu) {
+		clear_bit(BTUSB_NEXT_RX_URB_SUBMITTING, &data->flags);
+	}
 
 	btusb_stop_traffic(data);
-	mdelay(URB_CANCELING_DELAY_MS);      // Added by Realtek
+	if (isRTL8723bu)
+		mdelay(URB_CANCELING_DELAY_MS);
 	usb_kill_anchored_urbs(&data->tx_anchor);
 
 	return 0;
@@ -1210,22 +1385,28 @@ static void play_deferred(struct btusb_data *data)
 	int err;
 
 	while ((urb = usb_get_from_anchor(&data->deferred))) {
-
-	       /************************************/
-		usb_anchor_urb(urb, &data->tx_anchor);
-		err = usb_submit_urb(urb, GFP_ATOMIC);
-		if (err < 0) {
-			RTKBT_ERR("play_deferred urb %p submission failed",  urb);
-			kfree(urb->setup_packet);
-			usb_unanchor_urb(urb);
-		} else {
-			usb_mark_last_busy(data->udev);
+		if (isRTL8723bu) {
+			usb_anchor_urb(urb, &data->tx_anchor);
+			err = usb_submit_urb(urb, GFP_ATOMIC);
+			if (err < 0) {
+				BT_ERR("play_deferred urb %p submission failed",  urb);
+				kfree(urb->setup_packet);
+				usb_unanchor_urb(urb);
+			}
+			else
+				usb_mark_last_busy(data->udev);
+			usb_free_urb(urb);
 		}
-		usb_free_urb(urb);
-		/************************************/
+		else {
+			err = usb_submit_urb(urb, GFP_ATOMIC);
+			if (err < 0)
+				break;
+		}
+
 		data->tx_in_flight++;
 	}
-	mdelay(URB_CANCELING_DELAY_MS);     // Added by Realtek
+	if (isRTL8723bu)
+		mdelay(URB_CANCELING_DELAY_MS);
 	usb_scuttle_anchored_urbs(&data->deferred);
 }
 
@@ -1235,27 +1416,23 @@ static int btusb_resume(struct usb_interface *intf)
 	struct hci_dev *hdev = data->hdev;
 	int err = 0;
 
-	if (intf->cur_altsetting->desc.bInterfaceNumber != 0)
-		return 0;
+	BT_DBG("intf %p", intf);
 
-	/*******************************/
-	RTKBT_DBG("btusb_resume data->suspend_count=%d",data->suspend_count);
-
-	if (!test_bit(HCI_RUNNING, &hdev->flags))
-	{
-		RTKBT_DBG("btusb_resume-----bt is off,download patch");
-		download_patch(intf);
+	if (isRTL8723bu) {
+		if (!test_bit(HCI_RUNNING, &hdev->flags)) {
+			BT_DBG("btusb_resume-----bt is off,download patch");
+			download_patch(intf);
+		}
+		else
+			BT_DBG("btusb_resume,----bt is on");
+		set_bit(BTUSB_NEXT_RX_URB_SUBMITTING, &data->flags);
 	}
-	else
-	        RTKBT_DBG("btusb_resume,----bt is on");
-	/*******************************/
+
 	if (--data->suspend_count)
 		return 0;
 
-	/*******************************/
-	// Added by Realtek
-	set_bit(BTUSB_NEXT_RX_URB_SUBMITTING, &data->flags);
-	/*******************************/
+	if (!test_bit(HCI_RUNNING, &hdev->flags))
+		goto done;
 
 	if (test_bit(BTUSB_INTR_RUNNING, &data->flags)) {
 		err = btusb_submit_intr_urb(hdev, GFP_NOIO);
@@ -1291,9 +1468,10 @@ static int btusb_resume(struct usb_interface *intf)
 	return 0;
 
 failed:
-	mdelay(URB_CANCELING_DELAY_MS);      // Added by Realtek
+	if (isRTL8723bu)
+		mdelay(URB_CANCELING_DELAY_MS);
 	usb_scuttle_anchored_urbs(&data->deferred);
-//done:
+done:
 	spin_lock_irq(&data->txlock);
 	clear_bit(BTUSB_SUSPENDING, &data->flags);
 	spin_unlock_irq(&data->txlock);
@@ -1310,38 +1488,30 @@ static struct usb_driver btusb_driver = {
 	.suspend	= btusb_suspend,
 	.resume		= btusb_resume,
 #endif
-#if  CONFIG_RESET_RESUME
-	.reset_resume = btusb_resume,
-#endif
 	.id_table	= btusb_table,
 	.supports_autosuspend = 1,
-#if LINUX_VERSION_CODE > KERNEL_VERSION(3, 7, 1)
 	.disable_hub_initiated_lpm = 1,
-#endif
 };
 
-static int __init btusb_init(void)
-{
-	RTKBT_DBG("Realtek Bluetooth USB driver ver %s", VERSION);
-	return usb_register(&btusb_driver);
-}
+module_usb_driver(btusb_driver);
 
-static void __exit btusb_exit(void)
-{
-	RTKBT_DBG(KERN_INFO "rtk_btusb: btusb_exit");
-	usb_deregister(&btusb_driver);
-}
+module_param(disable_scofix, bool, 0644);
+MODULE_PARM_DESC(disable_scofix, "Disable fixup of wrong SCO buffer size");
 
-module_init(btusb_init);
-module_exit(btusb_exit);
+module_param(force_scofix, bool, 0644);
+MODULE_PARM_DESC(force_scofix, "Force fixup of wrong SCO buffers size");
 
-MODULE_AUTHOR("");
-MODULE_DESCRIPTION("Realtek Bluetooth USB driver ver " VERSION);
+module_param(reset, bool, 0644);
+MODULE_PARM_DESC(reset, "Send HCI reset command on initialization");
+
+MODULE_AUTHOR("Marcel Holtmann <marcel@holtmann.org>");
+MODULE_DESCRIPTION("Generic Bluetooth USB driver ver " VERSION);
 MODULE_VERSION(VERSION);
 MODULE_LICENSE("GPL");
 
 
 
+#ifdef RTL8723BU_SUPPORT
 /*******************************
 **    Reasil patch code
 ********************************/
@@ -1489,12 +1659,12 @@ static patch_info fw_patch_table[] = {
 
 static LIST_HEAD(dev_data_list);
 
-int patch_add(struct usb_interface* intf)
+static int patch_add(struct usb_interface* intf)
 {
 	dev_data	*dev_entry;
 	struct usb_device *udev;
 
-	RTKBT_DBG("patch_add");
+	BT_DBG("patch_add");
 	dev_entry = dev_data_find(intf);
 	if (NULL != dev_entry)
 	{
@@ -1503,11 +1673,11 @@ int patch_add(struct usb_interface* intf)
 
 	udev = interface_to_usbdev(intf);
 #if BTUSB_RPM
-	RTKBT_DBG("auto suspend is enabled");
+	BT_DBG("auto suspend is enabled");
 	usb_enable_autosuspend(udev);
 	pm_runtime_set_autosuspend_delay(&(udev->dev),2000);
 #else
-	RTKBT_DBG("auto suspend is disabled");
+	BT_DBG("auto suspend is disabled");
 	usb_disable_autosuspend(udev);
 #endif
 
@@ -1527,7 +1697,7 @@ int patch_add(struct usb_interface* intf)
 	return 0;
 }
 
-void patch_remove(struct usb_interface* intf)
+static void patch_remove(struct usb_interface* intf)
 {
 	dev_data *dev_entry;
 	struct usb_device *udev;
@@ -1543,25 +1713,25 @@ void patch_remove(struct usb_interface* intf)
 		return;
 	}
 
-	RTKBT_DBG("patch_remove");
+	BT_DBG("patch_remove");
 	list_del(&dev_entry->list_node);
 	unregister_pm_notifier(&dev_entry->pm_notifier);
 	kfree(dev_entry);
 }
 
-int download_patch(struct usb_interface* intf)
+static int download_patch(struct usb_interface* intf)
 {
 	dev_data		*dev_entry;
 	xchange_data	*xdata = NULL;
 	uint8_t			*fw_buf;
 	int				ret_val;
 
-	RTKBT_DBG("download_patch start");
+	BT_DBG("download_patch start");
 	dev_entry = dev_data_find(intf);
 	if (NULL == dev_entry)
 	{
 		ret_val = -1;
-		RTKBT_ERR("NULL == dev_entry");
+		BT_ERR("NULL == dev_entry");
 		goto patch_end;
 	}
 
@@ -1569,7 +1739,7 @@ int download_patch(struct usb_interface* intf)
 	if(NULL == xdata)
 	{
 		ret_val = -1;
-		RTKBT_DBG("NULL == xdata");
+		BT_DBG("NULL == xdata");
 		goto patch_end;
 	}
 
@@ -1578,7 +1748,7 @@ int download_patch(struct usb_interface* intf)
 	if (ret_val != 0)
 	{
 		if(gEVersion == 0xFF) {
-			RTKBT_DBG("global_version is not set, get it!");
+			BT_DBG("global_version is not set, get it!");
 			gEVersion=rtk_get_eversion(dev_entry);
 		}
 		goto patch_end;
@@ -1587,7 +1757,7 @@ int download_patch(struct usb_interface* intf)
 	ret_val = get_firmware(xdata);
 	if (ret_val < 0)
 	{
-		RTKBT_ERR("get_firmware failed!");
+		BT_ERR("get_firmware failed!");
 		goto patch_end;
 	}
 	fw_buf = xdata->fw_data;
@@ -1595,7 +1765,7 @@ int download_patch(struct usb_interface* intf)
 	ret_val = download_data(xdata);
 	if (ret_val < 0)
 	{
-		RTKBT_ERR("download_data failed!");
+		BT_ERR("download_data failed!");
 		goto patch_fail;
 	}
 
@@ -1618,17 +1788,17 @@ patch_end:
 			kfree(xdata->rcv_pkt);
         	kfree(xdata);
 	}
-	RTKBT_DBG("Rtk patch end %d", ret_val);
+	BT_DBG("Rtk patch end %d", ret_val);
 	return ret_val;
 }
 
-int set_btoff(struct usb_interface* intf)
+static int set_btoff(struct usb_interface* intf)
 {
 	dev_data		*dev_entry;
 	xchange_data	*xdata = NULL;
 	int				ret_val;
 
-	RTKBT_DBG("set_btoff");
+	BT_DBG("set_btoff");
 	dev_entry = dev_data_find(intf);
 	if (NULL == dev_entry)
 	{
@@ -1639,7 +1809,7 @@ int set_btoff(struct usb_interface* intf)
 	if(NULL == xdata)
 	{
 		ret_val = -1;
-		RTKBT_DBG("NULL == xdata");
+		BT_DBG("NULL == xdata");
               return ret_val;
        }
 
@@ -1673,13 +1843,13 @@ tagEnd:
         	kfree(xdata);
 	}
 
-	RTKBT_DBG("set_btoff done");
+	BT_DBG("set_btoff done");
 
 	return ret_val;
 }
 
 
-dev_data* dev_data_find(struct usb_interface* intf)
+static dev_data* dev_data_find(struct usb_interface* intf)
 {
 	dev_data *dev_entry;
 
@@ -1694,19 +1864,19 @@ dev_data* dev_data_find(struct usb_interface* intf)
 	return NULL;
 }
 
-patch_info* get_patch_entry(struct usb_device* udev)
+static patch_info* get_patch_entry(struct usb_device* udev)
 {
 	patch_info	*patch_entry;
 	uint16_t	pid;
 
 	patch_entry = fw_patch_table;
 	pid = le16_to_cpu(udev->descriptor.idProduct);
-	RTKBT_DBG("pid = 0x%x", pid);
+	BT_DBG("pid = 0x%x", pid);
 	while (pid != patch_entry->prod_id)
 	{
 		if (0 == patch_entry->prod_id)
 		{
-			RTKBT_DBG("get_patch_entry =NULL, can not find device pid in patch_table");
+			BT_DBG("get_patch_entry =NULL, can not find device pid in patch_table");
 			return NULL;	//break;
 		}
 		patch_entry++;
@@ -1715,7 +1885,7 @@ patch_info* get_patch_entry(struct usb_device* udev)
 	return patch_entry;
 }
 
-int rtkbt_pm_notify(
+static int rtkbt_pm_notify(
 	struct notifier_block* notifier,
 	ulong	pm_event,
 	void*	unused)
@@ -1727,7 +1897,7 @@ int rtkbt_pm_notify(
 	dev_entry = container_of(notifier, dev_data, pm_notifier);
 	patch_entry = dev_entry->patch_entry;
 	udev = dev_entry->udev;
-	RTKBT_DBG("rtkbt_pm_notify pm_event =%ld",pm_event);
+	BT_DBG("rtkbt_pm_notify pm_event =%ld",pm_event);
 	switch (pm_event)
 	{
 		case PM_SUSPEND_PREPARE:
@@ -1735,17 +1905,17 @@ int rtkbt_pm_notify(
 			patch_entry->fw_len = load_firmware(dev_entry, &patch_entry->fw_cache);
 			if (patch_entry->fw_len <= 0)
 			{
-				RTKBT_DBG("rtkbt_pm_notify return NOTIFY_BAD");
+				BT_DBG("rtkbt_pm_notify return NOTIFY_BAD");
 				return NOTIFY_BAD;
 			}
 
 			if (!device_may_wakeup(&udev->dev))
 			{
 				#if (CONFIG_RESET_RESUME || CONFIG_BLUEDROID)
-					RTKBT_DBG("remote wakeup not support, reset_resume support ");
+					BT_DBG("remote wakeup not support, reset_resume support ");
 				#else
 					dev_entry->intf->needs_binding = 1;
-					RTKBT_DBG("remote wakeup not support, set intf->needs_binding = 1");
+					BT_DBG("remote wakeup not support, set intf->needs_binding = 1");
 				#endif
 			}
 			break;
@@ -1773,7 +1943,7 @@ int rtkbt_pm_notify(
 	return NOTIFY_DONE;
 }
 
-int rtk_parse_config_file(unsigned char* config_buf, int* filelen, char bt_addr[6])
+static int rtk_parse_config_file(unsigned char* config_buf, int* filelen, char bt_addr[6])
 {
     struct rtk_bt_vendor_config* config = (struct rtk_bt_vendor_config*)config_buf;
     uint16_t config_len = config->data_len, temp = 0;
@@ -1786,13 +1956,13 @@ int rtk_parse_config_file(unsigned char* config_buf, int* filelen, char bt_addr[
 	return 0;
     if (config->signature != RTK_VENDOR_CONFIG_MAGIC)
     {
-        RTKBT_ERR("config signature magic number(%x) is not set to RTK_VENDOR_CONFIG_MAGIC", config->signature);
+        BT_ERR("config signature magic number(%x) is not set to RTK_VENDOR_CONFIG_MAGIC", config->signature);
         return 0;
     }
 
     if (config_len != *filelen - sizeof(struct rtk_bt_vendor_config))
     {
-        RTKBT_ERR("config len(%x) is not right(%x)", config_len, *filelen-sizeof(struct rtk_bt_vendor_config));
+        BT_ERR("config len(%x) is not right(%x)", config_len, *filelen-sizeof(struct rtk_bt_vendor_config));
         return 0;
     }
 
@@ -1807,12 +1977,12 @@ int rtk_parse_config_file(unsigned char* config_buf, int* filelen, char bt_addr[
                 config_has_bdaddr = 1;
                 for (j=0; j<entry->entry_len; j++)
                     entry->entry_data[j] = bt_addr[entry->entry_len - 1- j];
-                RTKBT_DBG("rtk_parse_config_file: config has bdaddr");
+                BT_DBG("rtk_parse_config_file: config has bdaddr");
                 break;
             }
 
             default:
-                RTKBT_DBG("config offset(%x),length(%x)", entry->offset, entry->entry_len);
+                BT_DBG("config offset(%x),length(%x)", entry->offset, entry->entry_len);
                 break;
         }
         temp = entry->entry_len + sizeof(struct rtk_bt_vendor_config_entry);
@@ -1822,7 +1992,7 @@ int rtk_parse_config_file(unsigned char* config_buf, int* filelen, char bt_addr[
 
     return 1;
 }
-int load_firmware(dev_data* dev_entry, uint8_t** buff)
+static int load_firmware(dev_data* dev_entry, uint8_t** buff)
 {
 	const struct firmware	*fw;
 	struct usb_device		*udev;
@@ -1842,13 +2012,13 @@ int load_firmware(dev_data* dev_entry, uint8_t** buff)
 	// read bt mac address from file to  vnd_local_bd_addr
         uint8_t vnd_local_bd_addr[6]={0x01,0x02,0x03,0x04,0x05,0x06};
 
-	RTKBT_DBG("load_firmware start");
+	BT_DBG("load_firmware start");
 	udev = dev_entry->udev;
 	patch_entry = dev_entry->patch_entry;
 	lmp_version = patch_entry->lmp_sub;
 
 
-	RTKBT_ERR("lmp_version = 0x%04x", lmp_version);
+	BT_ERR("lmp_version = 0x%04x", lmp_version);
 
 	fw_name = patch_entry->config_name;
 	ret_val = request_firmware(&fw, fw_name, &udev->dev);
@@ -1881,21 +2051,21 @@ int load_firmware(dev_data* dev_entry, uint8_t** buff)
 
 	if(lmp_version == ROM_LMP_8723a)
 	{
-		RTKBT_ERR("This is 8723a, use old patch style!");
+		BT_ERR("This is 8723a, use old patch style!");
 		if(memcmp(epatch_buf, RTK_EPATCH_SIGNATURE, 8) == 0)
 		{
-			RTKBT_ERR("8723as Check signature error!");
+			BT_ERR("8723as Check signature error!");
 			need_download_fw = 0;
 	}
 		else
 		{
 			if (!(buf = kzalloc(buf_len, GFP_KERNEL))) {
-				RTKBT_ERR("Can't alloc memory for fw&config");
+				BT_ERR("Can't alloc memory for fw&config");
 				buf_len = -1;
 			}
 			else
 			{
-				RTKBT_DBG("8723as, fw copy direct");
+				BT_DBG("8723as, fw copy direct");
 				memcpy(buf,epatch_buf,buf_len);
 				kfree(epatch_buf);
 				epatch_buf = NULL;
@@ -1909,12 +2079,12 @@ int load_firmware(dev_data* dev_entry, uint8_t** buff)
 
 	else
 	{
-		RTKBT_ERR("This is not 8723a, use new patch style!");
+		BT_ERR("This is not 8723a, use new patch style!");
 		//Get version from ROM
 		gEVersion = rtk_get_eversion(dev_entry);  //gEVersion is set.
-		RTKBT_DBG("gEVersion=%d", gEVersion);
+		BT_DBG("gEVersion=%d", gEVersion);
 		if(gEVersion == 0xFE) {
-			RTKBT_DBG("gEVersion=%d", gEVersion);
+			BT_DBG("gEVersion=%d", gEVersion);
 			need_download_fw = 0;
 			fw_len = 0;
 			goto alloc_fail;
@@ -1923,7 +2093,7 @@ int load_firmware(dev_data* dev_entry, uint8_t** buff)
 		//check Extension Section Field
 		if(memcmp(epatch_buf + buf_len-config_len-4 ,Extension_Section_SIGNATURE,4) != 0)
 		{
-			RTKBT_ERR("Check Extension_Section_SIGNATURE error! do not download fw");
+			BT_ERR("Check Extension_Section_SIGNATURE error! do not download fw");
 			need_download_fw = 0;
 		}
 		else
@@ -1939,9 +2109,9 @@ int load_firmware(dev_data* dev_entry, uint8_t** buff)
 					{
 						memcpy(patch_lmp.data,temp-2,patch_lmp.length);
 					}
-					RTKBT_DBG("opcode = 0x%x",patch_lmp.opcode);
-					RTKBT_DBG("length = 0x%x",patch_lmp.length);
-					RTKBT_DBG("data = 0x%x",*(patch_lmp.data));
+					BT_DBG("opcode = 0x%x",patch_lmp.opcode);
+					BT_DBG("length = 0x%x",patch_lmp.length);
+					BT_DBG("data = 0x%x",*(patch_lmp.data));
 					break;
 				}
 				temp -= *(temp-1)+2;
@@ -1949,16 +2119,16 @@ int load_firmware(dev_data* dev_entry, uint8_t** buff)
 
 			if(lmp_version != project_id[*(patch_lmp.data)])
 			{
-				RTKBT_ERR("lmp_version is %x, project_id is %x, does not match!!!",lmp_version,project_id[*(patch_lmp.data)]);
+				BT_ERR("lmp_version is %x, project_id is %x, does not match!!!",lmp_version,project_id[*(patch_lmp.data)]);
 				need_download_fw = 0;
 			}
 			else
 			{
-				RTKBT_DBG("lmp_version is %x, project_id is %x, match!",lmp_version, project_id[*(patch_lmp.data)]);
+				BT_DBG("lmp_version is %x, project_id is %x, match!",lmp_version, project_id[*(patch_lmp.data)]);
 
 				if(memcmp(epatch_buf, RTK_EPATCH_SIGNATURE, 8) != 0)
 				{
-					RTKBT_DBG("Check signature error!");
+					BT_DBG("Check signature error!");
 					need_download_fw = 0;
 				}
 				else
@@ -1967,8 +2137,8 @@ int load_firmware(dev_data* dev_entry, uint8_t** buff)
 					epatch_info = (struct rtk_epatch*)epatch_buf;
 					epatch_info->fw_version=le32_to_cpu(epatch_info->fw_version);
 					epatch_info->number_of_total_patch=le16_to_cpu(epatch_info->number_of_total_patch);
-					RTKBT_DBG("fw_version = 0x%x",epatch_info->fw_version); 
-					RTKBT_DBG("number_of_total_patch = %d",epatch_info->number_of_total_patch);
+					BT_DBG("fw_version = 0x%x",epatch_info->fw_version); 
+					BT_DBG("number_of_total_patch = %d",epatch_info->number_of_total_patch);
 
 					//get right epatch entry
 					for(i=0; i<epatch_info->number_of_total_patch; i++)
@@ -1981,16 +2151,16 @@ int load_firmware(dev_data* dev_entry, uint8_t** buff)
 							break;
 						}
 					}
-					RTKBT_DBG("chipID = %d",current_entry.chipID);
-					RTKBT_DBG("patch_length = 0x%x",current_entry.patch_length);
-					RTKBT_DBG("start_offset = 0x%x",current_entry.start_offset);
+					BT_DBG("chipID = %d",current_entry.chipID);
+					BT_DBG("patch_length = 0x%x",current_entry.patch_length);
+					BT_DBG("start_offset = 0x%x",current_entry.start_offset);
 
 					//get right eversion patch: buf, buf_len
 					buf_len = current_entry.patch_length + config_len;
-					RTKBT_DBG("buf_len = 0x%x",buf_len);
+					BT_DBG("buf_len = 0x%x",buf_len);
 
 					if (!(buf = kzalloc(buf_len, GFP_KERNEL))) {
-						RTKBT_ERR("Can't alloc memory for multi fw&config");
+						BT_ERR("Can't alloc memory for multi fw&config");
 						buf_len = -1;
 					}
 					else
@@ -2015,14 +2185,14 @@ int load_firmware(dev_data* dev_entry, uint8_t** buff)
        if (config_file_buf)
         	 kfree(config_file_buf);
 
-	RTKBT_ERR("Fw:%s exists, config file:%s exists", (buf_len > 0) ? "":"not", (config_len>0)?"":"not");
+	BT_ERR("Fw:%s exists, config file:%s exists", (buf_len > 0) ? "":"not", (config_len>0)?"":"not");
 	if (buf && (buf_len > 0) && (need_download_fw))
 	{
 		fw_len = buf_len;
 		*buff = buf;
 	}
 
-	RTKBT_DBG("load_firmware done");
+	BT_DBG("load_firmware done");
 
 alloc_fail:
 	release_firmware(fw);
@@ -2030,7 +2200,7 @@ fw_fail:
 	return fw_len;
 }
 
-void init_xdata(
+static void init_xdata(
 	xchange_data*	xdata,
 	dev_data*		dev_entry)
 {
@@ -2047,7 +2217,7 @@ void init_xdata(
 	xdata->rsp_para = xdata->rcv_pkt + EVT_HDR_LEN + CMD_CMP_LEN;
 }
 
-int check_fw_version(xchange_data* xdata)
+static int check_fw_version(xchange_data* xdata)
 {
 	struct hci_rp_read_local_version *read_ver_rsp;
 	patch_info	*patch_entry;
@@ -2075,8 +2245,8 @@ int check_fw_version(xchange_data* xdata)
 	read_ver_rsp->hci_rev=le16_to_cpu(read_ver_rsp->hci_rev);
 	read_ver_rsp->manufacturer=le16_to_cpu(read_ver_rsp->manufacturer);
 
-	RTKBT_DBG("check_fw_version : read_ver_rsp->lmp_subver = 0x%x",read_ver_rsp->lmp_subver);
-	RTKBT_DBG("check_fw_version : patch_entry->lmp_sub = 0x%x",patch_entry->lmp_sub);
+	BT_DBG("check_fw_version : read_ver_rsp->lmp_subver = 0x%x",read_ver_rsp->lmp_subver);
+	BT_DBG("check_fw_version : patch_entry->lmp_sub = 0x%x",patch_entry->lmp_sub);
 	if (patch_entry->lmp_sub != read_ver_rsp->lmp_subver)
 	{
 		return 1;
@@ -2087,16 +2257,16 @@ version_end:
 	return ret_val;
 }
 
-uint8_t rtk_get_eversion(dev_data * dev_entry)
+static uint8_t rtk_get_eversion(dev_data * dev_entry)
 {
 	struct rtk_eversion_evt *eversion;
 	patch_info	*patch_entry;
 	int			ret_val = 0;
 	xchange_data* xdata = NULL;
 
-	RTKBT_DBG("rtk_get_eversion::gEVersion=%d", gEVersion);
+	BT_DBG("rtk_get_eversion::gEVersion=%d", gEVersion);
 	if(gEVersion != 0xFF && gEVersion != 0xFE) {
-		RTKBT_DBG("gEVersion != 0xFF, return it directly!");
+		BT_DBG("gEVersion != 0xFF, return it directly!");
 		return gEVersion;
 	}
 
@@ -2104,7 +2274,7 @@ uint8_t rtk_get_eversion(dev_data * dev_entry)
 	if(NULL == xdata)
 	{
 		ret_val = 0xFE;
-		RTKBT_DBG("NULL == xdata");
+		BT_DBG("NULL == xdata");
               return ret_val;
        }
 
@@ -2130,7 +2300,7 @@ uint8_t rtk_get_eversion(dev_data * dev_entry)
 
 	patch_entry = xdata->dev_entry->patch_entry;
 	eversion = (struct rtk_eversion_evt*)(xdata->rsp_para);
-	RTKBT_DBG("rtk_get_eversion : eversion->status = 0x%x, eversion->version = 0x%x",eversion->status, eversion->version);
+	BT_DBG("rtk_get_eversion : eversion->status = 0x%x, eversion->version = 0x%x",eversion->status, eversion->version);
 	if (eversion->status)
 	{
 		ret_val = 0;
@@ -2155,11 +2325,11 @@ version_end:
 
 }
 
-int get_firmware(xchange_data* xdata)
+static int get_firmware(xchange_data* xdata)
 {
 	dev_data	*dev_entry;
 	patch_info	*patch_entry;
-	RTKBT_DBG("get_firmware start");
+	BT_DBG("get_firmware start");
 
 	dev_entry = xdata->dev_entry;
 	patch_entry = dev_entry->patch_entry;
@@ -2175,11 +2345,11 @@ int get_firmware(xchange_data* xdata)
 		xdata->fw_len = load_firmware(dev_entry, &xdata->fw_data);
 		if (xdata->fw_len <= 0) return -1;
 	}
-	RTKBT_DBG("get_firmware done");
+	BT_DBG("get_firmware done");
 	return 0;
 }
 
-int download_data(xchange_data* xdata)
+static int download_data(xchange_data* xdata)
 {
 	download_cp *cmd_para;
 	download_rp *evt_para;
@@ -2187,7 +2357,7 @@ int download_data(xchange_data* xdata)
 	int			pkt_len, frag_num, frag_len;
 	int			i, ret_val;
 
-	RTKBT_DBG("download_data start");
+	BT_DBG("download_data start");
 
 	cmd_para = (download_cp*)xdata->req_para;
 	evt_para = (download_rp*)xdata->rsp_para;
@@ -2229,11 +2399,11 @@ int download_data(xchange_data* xdata)
 		pcur += PATCH_SEG_MAX;
 	}
 
-	RTKBT_DBG("download_data done");
+	BT_DBG("download_data done");
 	return xdata->fw_len;
 }
 
-int send_hci_cmd(xchange_data* xdata)
+static int send_hci_cmd(xchange_data* xdata)
 {
 	int ret_val;
 
@@ -2246,7 +2416,7 @@ int send_hci_cmd(xchange_data* xdata)
 	return ret_val;
 }
 
-int rcv_hci_evt(xchange_data* xdata)
+static int rcv_hci_evt(xchange_data* xdata)
 {
 	int ret_len = 0, ret_val = 0;
 	int i;   // Added by Realtek
@@ -2282,7 +2452,7 @@ int rcv_hci_evt(xchange_data* xdata)
 	}
 }
 
-void print_acl (struct sk_buff *skb,int dataOut)
+static void print_acl (struct sk_buff *skb,int dataOut)
 {
 #if PRINT_ACL_DATA
 	uint wlength = skb->len;
@@ -2302,7 +2472,7 @@ void print_acl (struct sk_buff *skb,int dataOut)
 */
 #endif
 }
-void print_command(struct sk_buff *skb)
+static void print_command(struct sk_buff *skb)
 {
 #if PRINT_CMD_EVENT
 	uint wlength = skb->len;
@@ -2376,7 +2546,7 @@ void print_command(struct sk_buff *skb)
 
 #endif
 }
-void print_event(struct sk_buff *skb)
+static void print_event(struct sk_buff *skb)
 {
 #if PRINT_CMD_EVENT
 	uint wlength = skb->len;
@@ -2491,8 +2661,6 @@ void print_event(struct sk_buff *skb)
 			printk("%02x ",*(opcode+icount) );
 	}
 	printk("\n");
-
 #endif
-
 }
-
+#endif

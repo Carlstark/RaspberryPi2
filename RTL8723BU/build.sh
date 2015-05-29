@@ -10,8 +10,9 @@ print_usage() {
     echo
     echo "==============================================="
     echo "Driver Load Guide:"
-    echo "copy files under 'install' into rootfs"
-    echo "WIFI:     insmod 8723bu.ko; ifconfig wlan0"
+    echo "1. copy files under 'install' into rootfs"
+    echo "2. apt-get update; apt-get install bluetooth bluez-utils blueman rfkill"
+    echo "WIFI:     modprobe cfg80211; insmod 8723bu.ko; ifconfig wlan0"
     echo "BT:       modprobe bluetooth; insmod rtk_btusb.ko"
 }
 

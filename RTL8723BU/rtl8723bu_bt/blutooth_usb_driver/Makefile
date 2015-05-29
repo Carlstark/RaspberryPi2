@@ -3,7 +3,6 @@ ifneq ($(KERNELRELEASE),)
 
 else
 	PWD := $(shell pwd)
-	KVER := 3.18.13
 	KDIR := /work/rpi/linux
 
 all:
