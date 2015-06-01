@@ -1,9 +1,10 @@
 ifneq ($(KERNELRELEASE),)
 	obj-m := rtk_btusb.o
-
+	rtk_btusb-y = rtk_coex.o rtk_bt.o
 else
 	PWD := $(shell pwd)
-	KDIR := /work/rpi/linux
+	KVER := $(shell uname -r)
+	KDIR := /lib/modules/$(KVER)/build
 
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules -s
