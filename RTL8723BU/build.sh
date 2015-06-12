@@ -11,9 +11,39 @@ print_usage() {
     echo "==============================================="
     echo "Driver Load Guide:"
     echo "1. copy files under 'install' into rootfs"
-    echo "2. apt-get update; apt-get install bluetooth bluez-utils blueman rfkill"
+	echo "2. sudo ./setup.sh"
+    echo "3. apt-get update; apt-get install bluetooth bluez-utils blueman rfkill"
     echo "WIFI:     modprobe cfg80211; insmod 8723bu.ko; ifconfig wlan0"
     echo "BT:       modprobe bluetooth; insmod rtk_btusb.ko"
+}
+
+gen_setup() {
+	cat << EOF > install/setup.sh
+#!/bin/sh
+MDL_DIR="/lib/modules/\$(uname -r)"
+DRV_DIR="\${MDL_DIR}/kernel/drivers/bluetooth"
+
+cd "\$(dirname "\$0")"
+if [ -f "rtk_btusb.ko" ]; then
+    echo "Info: bluetooth drv ..."
+    cp -f rtk_btusb.ko \$DRV_DIR
+    for i in \$(ls lib/firmware/); do
+        cp -f lib/firmware/\$i /lib/firmware/
+    done
+fi
+
+DRV_DIR="\${MDL_DIR}/kernel/net/wireless"
+if [ -f "8723bu.ko" ]; then
+    echo "Info: wifi drv ..."
+    cp -f 8723bu.ko \$DRV_DIR
+fi
+
+depmod -a \$MDL_DIR
+if [ \$? = 0 ]; then
+    echo "Info: install success"
+fi
+EOF
+    chmod a+x install/setup.sh
 }
 
 build_clean() {
@@ -75,6 +105,7 @@ build_bt() {
 
 ! [ -d "install" ] && mkdir -p install
 ! [ -z "$2" ] && KERNELPATH="$2"
+gen_setup
 case "$1" in
 	"clean" )
 		build_clean

@@ -3,10 +3,23 @@
 * [Image] 2015-05-05-raspbian-wheezy.img
 * [Kernel] linux-3.18.14
 
-#### Build Source
+#### **Build Source**
 * `./build.sh all <kernelPath>`
 
 Target images are created under directory `install`.
+
+#### **Installation**
+
+* `pi@raspberrypi:~$ mkdir rtl`
+* Copy files under directory `install` to Raspberrypi2 rootfs,  under directory `/home/pi/rtl`
+* `pi@raspberrypi:~$ cd rtl`
+* `pi@raspberrypi:~/rtl$ sudo ./setup.sh`
+>Info: bluetooth drv ...
+Info: wifi drv ...
+Info: install success
+
+* `pi@raspberrypi:~$ cd ..; rm -rf rtl`
+
 
 #### **Usage**
 ---
@@ -59,3 +72,4 @@ Launch "Bluetooth Manager":
 
 * Menu -> Preferences -> Bluetooth Manager
 * Search -> Pair -> Send File...
+
